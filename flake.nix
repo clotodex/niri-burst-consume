@@ -84,7 +84,7 @@
             };
 
             config = lib.mkIf cfg.enable {
-              systemd.user.services.ashell = {
+              systemd.user.services.niri-burst-consume = {
                 Unit = {
                   Description = "Niri Burst Consume Daemon";
                   After = [ config.wayland.systemd.target ];
