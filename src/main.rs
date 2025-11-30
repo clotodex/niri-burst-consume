@@ -5,8 +5,10 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tracing::{debug, error, info};
 
 const THRESHOLD_MS: u128 = 500;
+const BUFFER_CAPACITY: usize = 4096;
 
 fn get_time_ms() -> u128 {
     SystemTime::now()
@@ -33,18 +35,19 @@ async fn send_action(id: u64) -> Result<()> {
 
     stream.write_all(request_json.as_bytes()).await?;
     stream.flush().await?;
-    println!("Sent action for window {}", id);
 
-    let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
-    reader.read_line(&mut response_line).await?;
-
-    let reply: Reply = serde_json::from_str(&response_line)?;
-    reply.map_err(|e| anyhow!("Niri error: {}", e)).map(|_| ())
+    Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
+        )
+        .init();
+
     let mut stream = connect().await?;
 
     // Send the EventStream request
@@ -53,7 +56,7 @@ async fn main() -> Result<()> {
     stream.flush().await?;
 
     // Create BufReader for the lifetime of this connection
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stream);
 
     // Read the Handled response
     let mut line = String::new();
@@ -66,14 +69,23 @@ async fn main() -> Result<()> {
     // State for iterator-like processing
     let mut last_id: Option<u64> = None;
     let mut last_timestamp: Option<u128> = None;
+    let mut last_column_id: Option<usize> = None;
     let mut cluster: Vec<u64> = Vec::new();
     let mut cluster_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    const RECENT_IDS_LIMIT: usize = 25;
+    let mut recent_ids: std::collections::VecDeque<u64> =
+        std::collections::VecDeque::with_capacity(RECENT_IDS_LIMIT);
 
     loop {
         line.clear();
         let bytes_read = reader.read_line(&mut line).await?;
         if bytes_read == 0 {
             break; // EOF
+        }
+
+        // Fast path: skip parsing if not a window event
+        if !line.contains("WindowOpenedOrChanged") {
+            continue;
         }
 
         let event: Event = serde_json::from_str(&line).context("Failed to parse Niri event")?;
@@ -83,12 +95,21 @@ async fn main() -> Result<()> {
             let id = window.id;
             let timestamp = get_time_ms();
 
-            // Deduplicate consecutive duplicates
+            // Deduplicate consecutive duplicates (could use recents system - but this is cheaper)
             if last_id == Some(id) {
                 continue;
             }
-
             last_id = Some(id);
+
+            // Skip if we've seen this window ID recently
+            if recent_ids.contains(&id) {
+                continue;
+            }
+            // Add to recent IDs, keeping only the last RECENT_IDS_LIMIT
+            recent_ids.push_back(id);
+            if recent_ids.len() > RECENT_IDS_LIMIT {
+                recent_ids.pop_front();
+            }
 
             // Calculate time difference
             let time_diff = last_timestamp.map(|last| timestamp - last);
@@ -97,38 +118,54 @@ async fn main() -> Result<()> {
             // Cluster logic
             match time_diff {
                 Some(diff) if diff <= THRESHOLD_MS => {
-                    // Within threshold, add to cluster if not already present
+                    if let Some((column_id, _)) = window.layout.pos_in_scrolling_layout
+                        && let Some(last_col) = last_column_id
+                        && column_id == last_col
+                    {
+                        debug!(
+                            "Window {} already in same column as previous window, skipping",
+                            id
+                        );
+                        continue;
+                    }
+
+                    // Add to cluster if not already present
                     if cluster_ids.insert(id) {
                         cluster.push(id);
-                        println!("Window {} opened within {}ms of previous window", id, diff);
-                        println!("Current cluster: {:?}", cluster);
+                        debug!("Window {} opened within {}ms of previous window", id, diff);
+                        debug!("Current cluster: {:?}", cluster);
 
                         // Consume this window into the column with the previous window
                         if let Err(e) = send_action(id).await {
-                            eprintln!("Failed to send consume action for window {}: {}", id, e);
+                            error!("Failed to send consume action for window {}: {}", id, e);
                         } else {
-                            println!("Sent consume-left action for window {}", id);
+                            debug!("Sent consume-left action for window {}", id);
                         }
                     }
                 }
                 _ => {
                     // Outside threshold or first window
                     if cluster.len() > 1 {
-                        println!(
+                        info!(
                             "=== Cluster completed with {} windows: {:?} ===",
                             cluster.len(),
                             cluster
                         );
                     }
 
-                    cluster = vec![id];
+                    cluster.clear();
+                    cluster.push(id);
                     cluster_ids.clear();
                     cluster_ids.insert(id);
+                    last_column_id = window
+                        .layout
+                        .pos_in_scrolling_layout
+                        .map(|(col_id, _)| col_id);
 
                     if let Some(diff) = time_diff {
-                        println!("New window: {} ({}ms gap)", id, diff);
+                        debug!("New window: {} ({}ms gap)", id, diff);
                     } else {
-                        println!("New window: {}", id);
+                        debug!("New window: {}", id);
                     }
                 }
             }
