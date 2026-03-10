@@ -24,6 +24,7 @@
         {
           config,
           pkgs,
+          system,
           ...
         }:
         let
@@ -32,8 +33,13 @@
         {
           packages.default = naersk'.buildPackage {
             src = ./.;
+            meta.mainProgram = "niri-burst-consume";
           };
 
+          _module.args.pkgs = import inputs.nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
           devShells.default = pkgs.mkShell {
             inputsFrom = [ config.packages.default ];
             packages = with pkgs; [
@@ -42,6 +48,7 @@
               rust-analyzer
               clippy
               rustfmt
+              claude-code
             ];
           };
         };
