@@ -70,8 +70,8 @@
 
               package = lib.mkOption {
                 type = lib.types.package;
-                default = inputs.self.packages.${pkgs.system}.default;
-                defaultText = lib.literalExpression "inputs.self.packages.\${pkgs.system}.default";
+                default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+                defaultText = lib.literalExpression "inputs.self.packages.\${pkgs.stdenv.hostPlatform.system}.default";
                 description = "The niri-burst-consume package to use";
               };
 
